@@ -1,14 +1,15 @@
 # agent-hooks
 
-A collection of Claude Code `PreToolUse` / `PostToolUse` hooks for safer, more automated agentic workflows.
+> **Claude Code only.** These hooks use the [Claude Code hook system](https://docs.anthropic.com/en/docs/claude-code/hooks) (`PreToolUse` / `PostToolUse` events in `~/.claude/settings.json`) and are not compatible with other agent frameworks (OpenClaw, Gemini CLI, etc.).
 
-Each hook lives in its own directory and is self-contained.
+A collection of hooks for safer, more automated Claude Code workflows. Each hook lives in its own directory and is self-contained.
 
 ## Hooks
 
 | Hook | Trigger | Purpose |
 |------|---------|---------|
 | [bash-guard](./bash-guard/) | `PreToolUse / Bash` | Block dangerous shell commands before execution |
+| [web-fetch-guard](./web-fetch-guard/) | `PreToolUse + PostToolUse / WebFetch` | Prompt injection protection for fetched web content |
 
 ## Installation pattern
 
