@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
 Bash command safety guard for Claude Code.
-Scans the FULL command string (including combined commands with &&, ||, ;, |)
-for dangerous patterns anywhere in the string — not just at the prefix.
+
+Three-tier decision model that sits on top of Claude Code's native permission system:
+
+  ALLOW — clearly safe, read-only operations.
+          Returns permissionDecision:"allow" so Claude Code skips its own prompt.
+
+  DENY  — catastrophic and irreversible (disk destruction, fork bombs, OS crashes).
+          Returns permissionDecision:"deny" — no permission prompt is ever shown.
+
+  WARN  — suspicious but not necessarily catastrophic (reverse shells, credential
+          reads, env-var injection, etc.). Returns permissionDecision:"defer" plus
+          a systemMessage so Claude Code's normal permission flow runs, but Claude
+          already has context on why this command is risky.
 
 Location: ~/.claude/hooks/bash_guard.py
 Loaded by: ~/.claude/settings.json (PreToolUse hook, Bash matcher)
@@ -12,189 +23,353 @@ import sys
 import json
 import re
 
-# Each entry: (regex_pattern, human_readable_reason)
-# Patterns use re.IGNORECASE | re.DOTALL and re.search (matches anywhere in string)
-DANGEROUS_PATTERNS = [
 
-    # ── Filesystem Destruction ────────────────────────────────────────────────
+# ── Tier 1: ALLOW ─────────────────────────────────────────────────────────────
+# Clearly safe, read-only operations with no dangerous variant.
+# Only matches standalone commands — anything with && || ; is excluded below
+# so a chained `git status && rm -rf /` can't sneak through here.
+#
+# Patterns are applied against the full command string with IGNORECASE.
 
-    # rm -rf targeting /, /*, ~, $HOME, or empty-variable expansion (SC2115)
-    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*/$',             '删除根目录 (rm -rf /)'),
-    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*/\*',            '删除根目录所有文件 (rm -rf /*)'),
-    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*~/?(\s|$)',      '删除 home 目录 (rm -rf ~)'),
-    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*\$HOME/?(\s|$)', '删除 HOME 目录 (rm -rf $HOME)'),
-    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*""/',            '空字符串变量展开导致根删除'),
-    (r'--no-preserve-root',                                          'rm --no-preserve-root 绕过保护'),
-
-    # Disk / partition overwrite
-    (r'\bdd\b.+\bof=/dev/(sd|hd|nvme|vd|xvd)',                     '覆写磁盘设备 (dd)'),
-    (r'\bshred\b.+/dev/(sd|hd|nvme)',                               '安全擦除磁盘 (shred)'),
-    (r'>\s*/dev/(sd|hd|nvme)[a-z0-9]',                             '重定向写入磁盘设备节点'),
-    (r'\bcat\s+/dev/(zero|urandom)\s+>\s*/dev/',                   'cat /dev/zero 覆写磁盘'),
-    (r'\bmkfs\b.*/dev/',                                            '格式化磁盘分区 (mkfs)'),
-
-    # Kernel panic / forced reboot via SysRq
-    (r'echo\s+[cb]\s*>\s*/proc/sysrq-trigger',                     '触发内核崩溃/强制重启 (SysRq)'),
-
-
-    # ── Fork Bombs & Resource Exhaustion ─────────────────────────────────────
-
-    # Classic and obfuscated variants: :(){ :|:& };:  ..(){..|..&}..  bomb(){ bomb|bomb& };bomb
-    (r'(\w+|\.|:)\s*\(\s*\)\s*\{[^}]*\|[^}]*&',                   'Fork bomb'),
-    (r'while\s+true\s*;\s*do\s+\$0\s*&',                           '进程自繁殖循环'),
-
-
-    # ── Remote Code Execution ─────────────────────────────────────────────────
-
-    (r'\bcurl\b[^|#\n]*\|\s*-?\s*(ba?sh|sh)\b',                    '远程代码执行 (curl | bash/sh)'),
-    (r'\bwget\b[^|#\n]*\|\s*-?\s*(ba?sh|sh)\b',                   '远程代码执行 (wget | bash/sh)'),
-    (r'\bcurl\b[^|#\n]*\|\s*python3?\b',                           '远程代码执行 (curl | python)'),
-    (r'\bwget\b[^|#\n]*\|\s*python3?\b',                           '远程代码执行 (wget | python)'),
-    (r'\bcurl\b[^|#\n]*\|\s*perl\b',                               '远程代码执行 (curl | perl)'),
-    (r'\bcurl\b[^|#\n]*\|\s*ruby\b',                               '远程代码执行 (curl | ruby)'),
-    (r'\bcurl\b[^|#\n]*\|\s*node\b',                               '远程代码执行 (curl | node)'),
-    # bash <(curl ...) and . <(curl ...)
-    (r'(bash|sh)\s*<\s*\(\s*(curl|wget)',                          '下载并执行 bash <(curl...)'),
-    (r'\.\s+<\s*\(\s*(curl|wget)',                                  'source 远程脚本 . <(curl...)'),
-    # source <(curl ...)
-    (r'\bsource\s+<\s*\(\s*(curl|wget)',                           'source 远程脚本 source <(curl...)'),
-    # eval with dynamic/remote content
-    (r'\beval\s+["\'\`\$\(]',                                      'eval 动态内容 (潜在代码注入)'),
-    (r'\beval\s+\$\(',                                              'eval 命令替换'),
-
-
-    # ── Reverse Shells ────────────────────────────────────────────────────────
-
-    (r'/dev/tcp/',                                                   '反向 Shell (bash /dev/tcp)'),
-    (r'/dev/udp/',                                                   '反向 Shell (bash /dev/udp)'),
-    # bash -i >& ...
-    (r'bash\s+-i\s+>&',                                             '反向 Shell (bash -i >&)'),
-    # nc -e /bin/sh  or  nc -e /bin/bash
-    (r'\bnc\b.+-e\s+/bin/(sh|bash)',                               '反向 Shell (nc -e)'),
-    # mkfifo pipe to nc pattern
-    (r'mkfifo\s+.+\|\s*(sh|bash)\s+-i.+nc\b',                     '反向 Shell (mkfifo | nc)'),
-    (r'\bncat\b.+-e\s+/bin/(sh|bash)',                             '反向 Shell (ncat -e)'),
-
-
-    # ── Credential & Sensitive File Access ───────────────────────────────────
-
-    (r'\bcat\s+/etc/shadow\b',                                      '读取密码哈希 (/etc/shadow)'),
-    (r'\bcat\s+/etc/sudoers\b',                                     '读取 sudoers 配置'),
-    # SSH private keys
-    (r'\bcat\b.+\.ssh/(id_rsa|id_ed25519|id_ecdsa|id_dsa)\b',     '读取 SSH 私钥'),
-    # AWS credentials
-    (r'\bcat\b.+\.aws/(credentials|config)\b',                      '读取 AWS 凭据'),
-    # .env files (only direct cat, not find - too noisy)
-    (r'\bcat\b.+/\.env\b',                                          '读取 .env 凭据文件'),
-    # /proc memory of sensitive processes
-    (r'\bcat\s+/proc/\d+/(mem|environ)\b',                         '读取进程内存/环境变量'),
-
-
-    # ── History & Log Tampering ───────────────────────────────────────────────
-
-    (r'HISTFILE\s*=\s*/dev/null',                                   '禁用 shell 历史 (HISTFILE=/dev/null)'),
-    (r'HISTSIZE\s*=\s*0',                                           '清空历史大小 (HISTSIZE=0)'),
-    (r'HISTFILESIZE\s*=\s*0',                                       '清空历史文件大小'),
-    (r'\bhistory\s+-[cw]\b',                                        '清除/覆盖 shell 历史 (history -c/-w)'),
-    (r'\bln\s+-sf?\s+/dev/null\s+.*bash_history',                  '将 bash_history 链接到 /dev/null'),
-    # Clear auth/syslog
-    (r'(cat\s+/dev/null|echo\s+""?)\s*>\s*/var/log/(auth|syslog|messages|secure)', '清空系统日志'),
-    (r'\brm\s+-rf?\s+/var/log/',                                    '删除系统日志目录'),
-    # Stop audit daemon
-    (r'(service|systemctl)\s+(stop|disable)\s+audit',              '停止审计守护进程 (auditd)'),
-
-
-    # ── Environment Variable Injection ───────────────────────────────────────
-
-    (r'\bLD_PRELOAD\s*=',                                           '动态库劫持 (LD_PRELOAD)'),
-    (r'\bLD_LIBRARY_PATH\s*=\s*/tmp',                               '劫持库搜索路径到 /tmp'),
-    (r'\bLD_AUDIT\s*=',                                             '动态链接器审计劫持 (LD_AUDIT)'),
-    (r'\bBASH_ENV\s*=',                                             'Shell 启动注入 (BASH_ENV)'),
-    (r'\bPROMPT_COMMAND\s*=',                                       '命令提示符注入 (PROMPT_COMMAND)'),
-    (r'\bPYTHONSTARTUP\s*=',                                        'Python 启动脚本注入'),
-    (r'\bNODE_OPTIONS\s*=.*--require',                              'Node.js 模块注入 (NODE_OPTIONS)'),
-    (r'\bJAVA_TOOL_OPTIONS\s*=.*-agent',                           'JVM Agent 注入'),
-
-
-    # ── Privilege Escalation ─────────────────────────────────────────────────
-
-    # SUID on shell binaries
-    (r'\bchmod\b.+[0-9]*4[0-9]*7[0-9]*\s+.*(bash|sh|zsh|python|perl|ruby)',
-                                                                     'SUID 设置在 shell/解释器上'),
-    # Recursive dangerous chmod on root paths
-    (r'\bchmod\b\s+(-R|--recursive)\s+[0-9]*7[0-9]*7\s+/',        '递归 777 根路径'),
-    # sudo to root shell
-    (r'\bsudo\s+(su|bash|sh|zsh|fish)(\s|$)',                      'sudo 提权到 root shell'),
-    (r'\bsudo\s+-[si]\b',                                           'sudo -s/-i 获取 root shell'),
-    # sudo + dangerous operations
-    (r'\bsudo\b.+\brm\b.+-[rf].+/',                                'sudo 递归删除系统路径'),
-    (r'\bsudo\b.+\bdd\b',                                           'sudo 磁盘操作'),
-    (r'\bsudo\b.+\bmkfs\b',                                         'sudo 格式化磁盘'),
-    (r'\bsudo\b.+\bchmod\b.+(-R|--recursive).+/',                  'sudo 递归修改系统路径权限'),
-    (r'\bsudo\b.+\bchown\b.+(-R|--recursive).+/',                  'sudo 递归修改系统路径所有权'),
-    # Overwrite /etc/passwd or /etc/shadow
-    (r'>>\s*/etc/(passwd|shadow)',                                   '写入 /etc/passwd 或 /etc/shadow'),
-    (r'echo\b.+>>\s*/etc/(passwd|shadow)',                          '追加内容到 passwd/shadow'),
-
-
-    # ── Persistence Mechanisms ────────────────────────────────────────────────
-
-    # Append reverse shell to shell startup files
-    (r'>>\s*~/?\.(bashrc|bash_profile|profile|zshrc|zprofile)',    '向 shell 启动文件植入后门'),
-    (r'>>\s*/etc/(bash\.bashrc|profile|bashrc)',                    '向系统 shell 启动文件植入后门'),
-    # Cron persistence
-    (r'>>\s*/etc/(crontab|cron\.d/)',                               '向系统 crontab 植入任务'),
-    (r'\bcrontab\b[^|]*\|\s*crontab\b',                            '通过管道修改 crontab (植入持久化)'),
-    # Unauthorized user creation
-    (r'\buseradd\b.+-u\s+0\b',                                     '创建 UID=0 后门用户'),
-    # SSH backdoor key
-    (r'>>\s*~?/\.ssh/authorized_keys',                              '向 authorized_keys 写入后门公钥'),
-
-
-    # ── Firewall / Security Controls Disabling ────────────────────────────────
-
-    (r'\biptables\s+-F\b',                                          '清空 iptables 防火墙规则'),
-    (r'\biptables\s+-P\s+INPUT\s+ACCEPT\b',                        '开放所有入站流量 (iptables)'),
-    (r'\bufw\s+disable\b',                                          '禁用 UFW 防火墙'),
-    (r'\bsystemctl\s+(stop|disable)\s+firewalld\b',                '禁用 firewalld'),
-    (r'\bsetenforce\s+0\b',                                         '关闭 SELinux 强制模式'),
-    (r'echo\s+0\s*>\s*/sys/fs/selinux/enforce',                    '关闭 SELinux (sysfs)'),
-
+_ALLOW_PATTERNS = [
+    r'^\s*l[sla]+(\s|$)',                                   # ls, ll, la, ls -la …
+    r'^\s*pwd(\s|$)',
+    r'^\s*(which|type)\s+\S',                               # which python3
+    r'^\s*uname(\s|-)',                                     # uname -a
+    r'^\s*ps\b',                                            # ps, ps aux
+    r'^\s*df\b',                                            # df -h
+    r'^\s*du\s+-[shHd]',                                    # du -sh …
+    r'^\s*git\s+(status|log|diff|branch|show|stash\s+list|remote\s+-v|tag)\b',
+    r'--version\b',                                         # any --version flag
 ]
+
+# Reject chaining operators — ALLOW only fires for simple, single-stage commands.
+_CHAIN_RE = re.compile(r'&&|\|\||(?<![\|&]);')
+
+
+def _is_safe_standalone(cmd: str) -> bool:
+    if _CHAIN_RE.search(cmd):
+        return False
+    return any(re.search(p, cmd, re.IGNORECASE) for p in _ALLOW_PATTERNS)
+
+
+# ── Tier 2: DENY ──────────────────────────────────────────────────────────────
+# Catastrophic, irreversible actions with near-zero legitimate use.
+# Hard-blocked — no permission prompt is shown to the user.
+#
+# Each entry: (regex_pattern, one-sentence explanation shown to the user)
+
+DENY_PATTERNS = [
+
+    # Root / home filesystem destruction
+    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*/$',
+     "This deletes every file on the root filesystem — the OS cannot recover."),
+
+    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*/\*',
+     "This deletes everything under / — the OS cannot recover."),
+
+    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*~/?(\s|$)',
+     "This deletes the entire home directory and everything in it."),
+
+    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*\$HOME/?(\s|$)',
+     "This deletes the entire home directory and everything in it."),
+
+    (r'\brm\s+(-\w+\s+)*-\w*r\w*f\w*\s+(-\w+\s+)*""/',
+     "An unquoted empty variable expands to /, which would delete the root filesystem."),
+
+    (r'--no-preserve-root',
+     "This flag removes the last safety guard on recursive root deletion."),
+
+    # Disk device destruction
+    (r'\bdd\b.+\bof=/dev/(sd|hd|nvme|vd|xvd)',
+     "Writing directly to a disk device permanently destroys its partition table and data."),
+
+    (r'\bcat\s+/dev/(zero|urandom)\s+>\s*/dev/',
+     "Overwriting a disk device with /dev/zero permanently erases all its data."),
+
+    (r'>\s*/dev/(sd|hd|nvme)[a-z0-9]',
+     "Redirecting output to a raw disk device will corrupt it permanently."),
+
+    (r'\bshred\b.+/dev/(sd|hd|nvme)',
+     "Shredding a disk device permanently destroys all data on it — no recovery possible."),
+
+    (r'\bmkfs\b.*/dev/',
+     "Formatting a partition erases everything on it permanently."),
+
+    # Fork bombs and resource exhaustion
+    (r'(\w+|\.|:)\s*\(\s*\)\s*\{[^}]*\|[^}]*&',
+     "This is a fork bomb — it spawns processes exponentially and will freeze the system."),
+
+    (r'while\s+true\s*;\s*do\s+\$0\s*&',
+     "This self-replicates infinitely in the background and will exhaust all system resources."),
+
+    # Kernel crash / forced reboot
+    (r'echo\s+[cb]\s*>\s*/proc/sysrq-trigger',
+     "Writing to sysrq-trigger triggers an immediate kernel crash or forced reboot."),
+]
+
+
+# ── Tier 3: WARN ──────────────────────────────────────────────────────────────
+# Suspicious but not necessarily catastrophic.
+# Passes to Claude Code's normal permission flow, but injects a systemMessage
+# so Claude already has context on the risk before asking the user.
+#
+# Each entry: (regex_pattern, one-sentence explanation for Claude and the user)
+
+WARN_PATTERNS = [
+
+    # Remote code execution
+    (r'\bcurl\b[^|#\n]*\|\s*-?\s*(ba?sh|sh)\b',
+     "Piping curl into bash runs whatever the remote server sends — the script is never shown to you."),
+
+    (r'\bwget\b[^|#\n]*\|\s*-?\s*(ba?sh|sh)\b',
+     "Piping wget into bash runs whatever the remote server sends — the script is never shown to you."),
+
+    (r'\bcurl\b[^|#\n]*\|\s*(python3?|perl|ruby|node)\b',
+     "Piping curl into an interpreter executes remote code without any local review."),
+
+    (r'\bwget\b[^|#\n]*\|\s*(python3?|perl|ruby|node)\b',
+     "Piping wget into an interpreter executes remote code without any local review."),
+
+    (r'(bash|sh)\s*<\s*\(\s*(curl|wget)',
+     "bash <(curl ...) downloads and immediately executes a script — its contents are never shown."),
+
+    (r'\.\s+<\s*\(\s*(curl|wget)',
+     "Sourcing a remote script via process substitution injects it into the current shell."),
+
+    (r'\bsource\s+<\s*\(\s*(curl|wget)',
+     "Sourcing a remote script injects its code directly into the current shell environment."),
+
+    (r'\beval\s+["\'\`\$\(]',
+     "eval executes a string as code — if that string comes from user input or a remote source, it's a code injection risk."),
+
+    # Reverse shells
+    (r'/dev/tcp/',
+     "Using /dev/tcp in bash can open a direct TCP connection to a remote host — a common reverse shell technique."),
+
+    (r'/dev/udp/',
+     "Using /dev/udp in bash can be used to send data to or receive commands from a remote host."),
+
+    (r'bash\s+-i\s+>&',
+     "This is a classic reverse shell pattern — it hands an interactive bash session to a remote IP."),
+
+    (r'\bnc\b.+-e\s+/bin/(sh|bash)',
+     "nc -e /bin/sh sends a live shell over the network to whoever is listening."),
+
+    (r'mkfifo\s+.+\|\s*(sh|bash)\s+-i.+nc\b',
+     "This mkfifo + nc combination is a well-known technique for establishing a reverse shell."),
+
+    (r'\bncat\b.+-e\s+/bin/(sh|bash)',
+     "ncat -e /bin/sh sends a live shell over the network to whoever is listening."),
+
+    # Credential and sensitive file access
+    (r'\bcat\s+/etc/shadow\b',
+     "/etc/shadow contains hashed passwords for every system user."),
+
+    (r'\bcat\s+/etc/sudoers\b',
+     "/etc/sudoers controls who can run commands as root — exposing it aids privilege escalation."),
+
+    (r'\bcat\b.+\.ssh/(id_rsa|id_ed25519|id_ecdsa|id_dsa)\b',
+     "This prints an SSH private key — it should never leave the local machine."),
+
+    (r'\bcat\b.+\.aws/(credentials|config)\b',
+     "AWS credentials grant full programmatic access to your cloud account."),
+
+    (r'\bcat\b.+/\.env\b',
+     ".env files typically contain API keys, database passwords, and other secrets."),
+
+    (r'\bcat\s+/proc/\d+/(mem|environ)\b',
+     "Reading /proc/<pid>/mem or environ can extract secrets from a running process."),
+
+    # History and log tampering
+    (r'HISTFILE\s*=\s*/dev/null',
+     "Redirecting HISTFILE to /dev/null prevents all shell commands from being recorded."),
+
+    (r'HISTSIZE\s*=\s*0|HISTFILESIZE\s*=\s*0',
+     "Setting history size to 0 clears the command history and stops new commands being saved."),
+
+    (r'\bhistory\s+-[cw]\b',
+     "history -c clears the in-memory command history; -w wipes the saved history file."),
+
+    (r'\bln\s+-sf?\s+/dev/null\s+.*bash_history',
+     "Symlinking bash_history to /dev/null permanently disables history recording."),
+
+    (r'(cat\s+/dev/null|echo\s+""?)\s*>\s*/var/log/(auth|syslog|messages|secure)',
+     "Clearing system log files destroys the audit trail for recent activity."),
+
+    (r'\brm\s+-rf?\s+/var/log/',
+     "Removing /var/log deletes all system audit trails and application logs."),
+
+    (r'(service|systemctl)\s+(stop|disable)\s+audit',
+     "Stopping the audit daemon disables system-wide security event logging."),
+
+    # Environment variable injection
+    (r'\bLD_PRELOAD\s*=',
+     "LD_PRELOAD forces a shared library to load before all others — a common rootkit injection technique."),
+
+    (r'\bLD_LIBRARY_PATH\s*=\s*/tmp',
+     "Pointing LD_LIBRARY_PATH at /tmp can cause any process to load malicious libraries."),
+
+    (r'\bLD_AUDIT\s*=',
+     "LD_AUDIT hooks into the dynamic linker and can intercept every library call made by a process."),
+
+    (r'\bBASH_ENV\s*=',
+     "BASH_ENV runs a file on every new bash invocation — an easy persistent injection point."),
+
+    (r'\bPROMPT_COMMAND\s*=',
+     "PROMPT_COMMAND executes a command before every shell prompt — a common persistence mechanism."),
+
+    (r'\bPYTHONSTARTUP\s*=',
+     "PYTHONSTARTUP runs a file whenever Python starts — it can inject code into every Python process."),
+
+    (r'\bNODE_OPTIONS\s*=.*--require',
+     "NODE_OPTIONS --require auto-loads a module into every Node.js process."),
+
+    (r'\bJAVA_TOOL_OPTIONS\s*=.*-agent',
+     "JAVA_TOOL_OPTIONS -agent injects a JVM agent into every Java process automatically."),
+
+    # Privilege escalation
+    (r'\bchmod\b.+[0-9]*4[0-9]*7[0-9]*\s+.*(bash|sh|zsh|python|perl|ruby)',
+     "Setting the SUID bit on a shell or interpreter lets any user run it as root."),
+
+    (r'\bchmod\b\s+(-R|--recursive)\s+[0-9]*7[0-9]*7\s+/',
+     "Recursively setting world-writable permissions on system paths is a serious security hole."),
+
+    (r'\bsudo\s+(su|bash|sh|zsh|fish)(\s|$)',
+     "sudo bash opens a root shell where subsequent commands leave no per-command audit trail."),
+
+    (r'\bsudo\s+-[si]\b',
+     "sudo -s/-i opens an interactive root shell."),
+
+    (r'\bsudo\b.+\brm\b.+-[rf].+/',
+     "Recursively removing paths under / with sudo can delete OS files and leave the system unbootable."),
+
+    (r'\bsudo\b.+\bdd\b',
+     "dd with sudo can overwrite disk devices or critical system files with no recovery path."),
+
+    (r'\bsudo\b.+\bmkfs\b',
+     "mkfs with sudo formats a partition, permanently erasing all data on it."),
+
+    (r'\bsudo\b.+\bchmod\b.+(-R|--recursive).+/',
+     "Recursively changing permissions on system paths with sudo can break OS access controls."),
+
+    (r'\bsudo\b.+\bchown\b.+(-R|--recursive).+/',
+     "Recursively changing ownership of system paths can lock out legitimate users and services."),
+
+    (r'>>\s*/etc/(passwd|shadow)',
+     "Appending to /etc/passwd or /etc/shadow can add backdoor accounts or corrupt authentication."),
+
+    (r'echo\b.+>>\s*/etc/(passwd|shadow)',
+     "Writing to /etc/passwd or /etc/shadow can introduce a root-level backdoor account."),
+
+    # Persistence mechanisms
+    (r'>>\s*~/?\.(bashrc|bash_profile|profile|zshrc|zprofile)',
+     "Appending to shell startup files runs arbitrary code every time a new shell opens."),
+
+    (r'>>\s*/etc/(bash\.bashrc|profile|bashrc)',
+     "Appending to system-wide shell startup files runs code for every user on the machine."),
+
+    (r'>>\s*/etc/(crontab|cron\.d/)',
+     "Adding a job to the system crontab schedules code to run automatically and persistently."),
+
+    (r'\bcrontab\b[^|]*\|\s*crontab\b',
+     "Piping into crontab replaces the existing cron schedule entirely — a common persistence trick."),
+
+    (r'\buseradd\b.+-u\s+0\b',
+     "Creating a user with UID 0 gives them full root privileges without using the root account."),
+
+    (r'>>\s*~?/\.ssh/authorized_keys',
+     "Adding to authorized_keys grants SSH access to whoever holds the matching private key."),
+
+    # Firewall and security controls
+    (r'\biptables\s+-F\b',
+     "iptables -F flushes all firewall rules, leaving every port on the machine open."),
+
+    (r'\biptables\s+-P\s+INPUT\s+ACCEPT\b',
+     "Setting the default INPUT policy to ACCEPT allows all inbound network connections."),
+
+    (r'\bufw\s+disable\b',
+     "Disabling UFW turns off the firewall and exposes all services to the network."),
+
+    (r'\bsystemctl\s+(stop|disable)\s+firewalld\b',
+     "Stopping firewalld removes all active firewall rules immediately."),
+
+    (r'\bsetenforce\s+0\b',
+     "setenforce 0 switches SELinux to permissive mode, disabling mandatory access controls."),
+
+    (r'echo\s+0\s*>\s*/sys/fs/selinux/enforce',
+     "Writing 0 to selinux/enforce disables SELinux enforcement system-wide."),
+]
+
+
+# ── Decision engine ────────────────────────────────────────────────────────────
+
+def _make_deny(hook_event: str, reason: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": hook_event,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": f"Blocked — {reason}",
+    }
+
+
+def _make_warn(hook_event: str, reason: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": hook_event,
+            "permissionDecision": "defer",
+        },
+        "systemMessage": (
+            f"Heads up: {reason} "
+            f"Confirm with the user before proceeding."
+        ),
+    }
+
+
+def _make_allow(hook_event: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": hook_event,
+            "permissionDecision": "allow",
+        }
+    }
 
 
 def main():
     try:
         data = json.load(sys.stdin)
-        cmd = data.get('tool_input', {}).get('command', '')
-        hook_event = data.get('hook_event_name', 'PreToolUse')
+        cmd = data.get("tool_input", {}).get("command", "")
+        hook_event = data.get("hook_event_name", "PreToolUse")
 
-        for pattern, reason in DANGEROUS_PATTERNS:
+        # 1. DENY — checked first so a chained command like
+        #    `git status && rm -rf /` can't slip through the ALLOW tier.
+        for pattern, reason in DENY_PATTERNS:
             if re.search(pattern, cmd, re.IGNORECASE | re.DOTALL):
-                output = {
-                    "hookSpecificOutput": {
-                        "hookEventName": hook_event,
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": f"危险命令被拦截: {reason}"
-                    },
-                    "systemMessage": (
-                        f"⚠️ 危险命令被拦截\n"
-                        f"原因: {reason}\n"
-                        f"命令: {cmd[:300]}"
-                    )
-                }
-                print(json.dumps(output, ensure_ascii=False))
+                print(json.dumps(_make_deny(hook_event, reason), ensure_ascii=False))
                 return
 
-        # No match — safe to proceed
-        print('{}')
+        # 2. WARN — suspicious but not catastrophic; defer to Claude Code.
+        for pattern, reason in WARN_PATTERNS:
+            if re.search(pattern, cmd, re.IGNORECASE | re.DOTALL):
+                print(json.dumps(_make_warn(hook_event, reason), ensure_ascii=False))
+                return
+
+        # 3. ALLOW — explicitly safe standalone command; skip permission prompt.
+        if _is_safe_standalone(cmd):
+            print(json.dumps(_make_allow(hook_event), ensure_ascii=False))
+            return
+
+        # 4. No opinion — let Claude Code decide normally.
+        print("{}")
 
     except Exception as e:
-        # Never block on hook errors, just surface a warning
+        # Never block on hook errors; surface a warning and let Claude Code proceed.
         print(json.dumps({"systemMessage": f"bash_guard error: {e}"}))
     finally:
         sys.exit(0)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
