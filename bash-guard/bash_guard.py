@@ -96,8 +96,12 @@ DENY_PATTERNS = [
     (r'\bmkfs\b.*/dev/',
      "Formatting a partition erases everything on it permanently."),
 
-    # Fork bombs and resource exhaustion
-    (r'(\w+|\.|:)\s*\(\s*\)\s*\{[^}]*\|[^}]*&',
+    # Fork bombs and resource exhaustion.
+    # A function whose body pipes itself into itself (":(){ :|:& };:") or starts
+    # itself in the background ("f(){ f & f; }"). Any other function that merely
+    # contains "|" and "&" ("2>&1", "&&") is ordinary shell code.
+    (r'(?<![\w.:-])(?P<fn>[\w-]+|\.|:)\s*\(\s*\)\s*\{[^}]*?(?<![\w.:-])(?P=fn)\s*'
+     r'(?:\|&?\s*(?P=fn)(?![\w.:-])|&(?![&>]))',
      "This is a fork bomb — it spawns processes exponentially and will freeze the system."),
 
     (r'while\s+true\s*;\s*do\s+\$0\s*&',
