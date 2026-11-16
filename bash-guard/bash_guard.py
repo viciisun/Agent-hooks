@@ -11,9 +11,13 @@ Three-tier decision model that sits on top of Claude Code's native permission sy
           Returns permissionDecision:"deny" — no permission prompt is ever shown.
 
   WARN  — suspicious but not necessarily catastrophic (reverse shells, credential
-          reads, env-var injection, etc.). Returns permissionDecision:"defer" plus
-          a systemMessage so Claude Code's normal permission flow runs, but Claude
-          already has context on why this command is risky.
+          reads, env-var injection, etc.). Returns permissionDecision:"ask" plus
+          a systemMessage, so the user confirms the command and Claude already has
+          context on why it is risky.
+
+          Not "defer": Claude Code treats "defer" as "suspend this tool call until an
+          external host resumes it". Claude desktop has no such host, so a deferred
+          call ended the whole turn ("Tool result missing due to internal error").
 
 Location: ~/.claude/hooks/bash_guard.py
 Loaded by: ~/.claude/settings.json (PreToolUse hook, Bash matcher)
@@ -115,10 +119,15 @@ DENY_PATTERNS = [
 
 # ── Tier 3: WARN ──────────────────────────────────────────────────────────────
 # Suspicious but not necessarily catastrophic.
-# Passes to Claude Code's normal permission flow, but injects a systemMessage
-# so Claude already has context on the risk before asking the user.
+# Asks the user to confirm the command (permissionDecision "ask") and injects a
+# systemMessage so Claude already has context on the risk.
 #
 # Each entry: (regex_pattern, one-sentence explanation for Claude and the user)
+
+# A cat invocation and its own arguments: same line, before any pipe, redirect or
+# separator. The secret-file rules below use it, so a heredoc that merely mentions
+# a secret path (a script written with `cat > file <<'EOF'`) is not flagged.
+_CAT_ARGS = r'\bcat\b(?:[ \t]+[^\s|;&<>]+)*?[ \t]+[^\s|;&<>]*'
 
 WARN_PATTERNS = [
 
@@ -173,13 +182,13 @@ WARN_PATTERNS = [
     (r'\bcat\s+/etc/sudoers\b',
      "/etc/sudoers controls who can run commands as root — exposing it aids privilege escalation."),
 
-    (r'\bcat\b.+\.ssh/(id_rsa|id_ed25519|id_ecdsa|id_dsa)\b',
+    (_CAT_ARGS + r'\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa)\b(?!\.pub\b)',
      "This prints an SSH private key — it should never leave the local machine."),
 
-    (r'\bcat\b.+\.aws/(credentials|config)\b',
+    (_CAT_ARGS + r'\.aws/(?:credentials|config)\b',
      "AWS credentials grant full programmatic access to your cloud account."),
 
-    (r'\bcat\b.+/\.env\b',
+    (_CAT_ARGS + r'(?<![\w-])\.env\b(?!\.(?:example|sample|template|dist)\b)',
      ".env files typically contain API keys, database passwords, and other secrets."),
 
     (r'\bcat\s+/proc/\d+/(mem|environ)\b',
@@ -323,7 +332,8 @@ def _make_warn(hook_event: str, reason: str) -> dict:
     return {
         "hookSpecificOutput": {
             "hookEventName": hook_event,
-            "permissionDecision": "defer",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
         },
         "systemMessage": (
             f"Heads up: {reason} "
@@ -354,7 +364,7 @@ def main():
                 print(json.dumps(_make_deny(hook_event, reason), ensure_ascii=False))
                 return
 
-        # 2. WARN — suspicious but not catastrophic; defer to Claude Code.
+        # 2. WARN — suspicious but not catastrophic; ask the user to confirm.
         for pattern, reason in WARN_PATTERNS:
             if re.search(pattern, cmd, re.IGNORECASE | re.DOTALL):
                 print(json.dumps(_make_warn(hook_event, reason), ensure_ascii=False))
