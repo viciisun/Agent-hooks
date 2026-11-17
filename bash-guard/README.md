@@ -9,7 +9,7 @@ Commands are evaluated in order against three tiers:
 | Tier | Decision | Effect |
 |------|----------|--------|
 | **DENY** | `permissionDecision: "deny"` | Hard-blocked immediately. No permission prompt is ever shown. Reserved for catastrophic, irreversible actions. |
-| **WARN** | `permissionDecision: "defer"` + `systemMessage` | Passes to Claude Code's normal permission flow, but injects a one-sentence explanation of the risk so Claude and the user are already briefed. |
+| **WARN** | `permissionDecision: "ask"` + `permissionDecisionReason` + `systemMessage` | Asks the user to confirm the command. The prompt shows a one-sentence explanation of the risk, and the same explanation is injected for Claude. |
 | **ALLOW** | `permissionDecision: "allow"` | Skips Claude Code's permission prompt entirely. Reserved for clearly safe, read-only operations. |
 | *(no match)* | `{}` | Hook has no opinion. Claude Code decides normally. |
 
@@ -26,9 +26,9 @@ Reserved for actions that are irreversible and have near-zero legitimate use:
 | System crash | `echo c > /proc/sysrq-trigger` |
 | Fork bombs | `:(){ :|:& };:` and variants |
 
-## WARN — deferred with context (~52 rules)
+## WARN — ask with context (58 rules)
 
-Suspicious commands that may have legitimate uses. Claude Code's permission prompt appears normally, with a human-readable risk summary injected as context:
+Suspicious commands that may have legitimate uses. The user is asked to confirm, with a human-readable risk summary in the prompt and injected as context for Claude:
 
 | Category | Examples |
 |----------|---------|
@@ -40,6 +40,8 @@ Suspicious commands that may have legitimate uses. Claude Code's permission prom
 | Privilege escalation | `sudo bash`, `chmod 4777 /bin/bash`, `>> /etc/passwd` |
 | Persistence | `>> ~/.bashrc`, `>> /etc/crontab`, `>> ~/.ssh/authorized_keys` |
 | Firewall disabling | `iptables -F`, `ufw disable`, `setenforce 0` |
+
+> Why `ask` and not `defer`: Claude Code treats `defer` as "suspend this tool call until an external host resumes it". The Claude desktop app has no such host, so a deferred call ended the whole turn.
 
 ## ALLOW — auto-approved (no prompt)
 
@@ -82,11 +84,12 @@ cp bash_guard.py ~/.claude/hooks/bash_guard.py
 ## Testing
 
 ```bash
-python3 tests/test_bash_guard.py
+python3 tests/test_bash_guard.py                                # repo copy
+python3 tests/test_bash_guard.py ~/.claude/hooks/bash_guard.py  # installed copy
 ```
 
 Non-destructive — pipes command strings to the script, never executes them.
-Expected: **66/66 passed**.
+Expected: **74/74 passed**.
 
 ## Adjusting coverage
 

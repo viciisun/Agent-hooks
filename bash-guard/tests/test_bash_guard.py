@@ -4,11 +4,12 @@ bash_guard.py test suite.
 
 Expected outcomes:
   "block" — hook returns permissionDecision:"deny" (hard-blocked, no prompt shown)
-  "warn"  — hook returns permissionDecision:"defer" + systemMessage
-             (passes to Claude Code's permission flow with context injected)
+  "warn"  — hook returns permissionDecision:"ask" + permissionDecisionReason
+             + systemMessage (the user confirms; Claude gets the risk context)
   "allow" — anything else: explicit "allow" or empty {} fall-through
 
-Run: python3 test_bash_guard.py
+Run: python3 test_bash_guard.py                                 # repo copy
+     python3 test_bash_guard.py ~/.claude/hooks/bash_guard.py   # installed copy
 Side-effects: none — only passes strings to bash_guard.py, no real commands run.
 """
 
@@ -17,7 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-GUARD_SCRIPT = Path.home() / ".claude/hooks/bash_guard.py"
+GUARD_SCRIPT = (Path(sys.argv[1]).expanduser() if len(sys.argv) > 1
+                else Path(__file__).resolve().parent.parent / "bash_guard.py")
 
 # ── Test cases ────────────────────────────────────────────────────────────────
 # Format: (command_string, expected_outcome, description)
@@ -69,6 +71,7 @@ TEST_CASES = [
     ("cat ~/.ssh/id_rsa",                           "warn",  "read SSH private key"),
     ("cat ~/.ssh/id_ed25519",                       "warn",  "read ed25519 key"),
     ("cat ~/.aws/credentials",                      "warn",  "read AWS credentials"),
+    ("cat .env",                                    "warn",  "read .env"),
 
     # ── History / log tampering — WARN ───────────────────────────────────────
     ("export HISTFILE=/dev/null",                   "warn",  "disable HISTFILE"),
@@ -108,6 +111,10 @@ TEST_CASES = [
     ("cat package.json",                            "allow", "cat ordinary file"),
     ("cat ~/.ssh/config",                           "allow", "cat SSH config (not a key)"),
     ("cat ~/.ssh/known_hosts",                      "allow", "cat known_hosts"),
+    ("cat ~/.ssh/id_ed25519.pub",                   "allow", "cat SSH public key"),
+    ("cat .env.example",                            "allow", "cat .env.example"),
+    ("cat > notes.md <<'EOF'\nKeys live in ~/.aws/credentials\nEOF",
+                                                    "allow", "heredoc that mentions a secret path"),
     ("history",                                     "allow", "view history (no -c)"),
     ("sudo apt install htop",                       "allow", "sudo install package"),
     ("sudo systemctl restart nginx",                "allow", "sudo restart service"),
@@ -123,12 +130,13 @@ TEST_CASES = [
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 def classify(output: dict) -> str:
-    decision = output.get("hookSpecificOutput", {}).get("permissionDecision", "")
+    hook = output.get("hookSpecificOutput", {})
+    decision = hook.get("permissionDecision", "")
     has_message = bool(output.get("systemMessage"))
 
     if decision == "deny":
         return "block"
-    if decision == "defer" and has_message:
+    if decision == "ask" and hook.get("permissionDecisionReason") and has_message:
         return "warn"
     return "allow"
 
